@@ -21,6 +21,31 @@ class InsufficientVolume(Exception):
         super().__init__(f"孔位 {well} 体积不足：可用 {available}，请求吸取 {requested}")
 
 
+class CapacityExceeded(Exception):
+    """补液或某一步移液会使目标孔体积超过其当前容量，触发整批回滚。"""
+
+    def __init__(self, well: str, current: Decimal, incoming: Decimal, capacity: Decimal) -> None:
+        self.well = well
+        self.current = current
+        self.incoming = incoming
+        self.capacity = capacity
+        super().__init__(
+            f"孔位 {well} 超过容量上限：当前体积 {current}，拟加入 {incoming}，上限 {capacity}"
+        )
+
+
+class CapacityBelowVolume(Exception):
+    """设置的新上限低于该孔当前体积：拒绝变更，容量配置保持不变。"""
+
+    def __init__(self, well: str, current: Decimal, capacity: Decimal) -> None:
+        self.well = well
+        self.current = current
+        self.capacity = capacity
+        super().__init__(
+            f"孔位 {well} 新上限 {capacity} 低于当前体积 {current}，容量未变更"
+        )
+
+
 def q(value: Decimal) -> Decimal:
     """量化到统一精度。quantize 单调不减，组分量不会被放大到超过原值。"""
     return value.quantize(QUANTUM, rounding=ROUND_HALF_UP)
@@ -46,6 +71,23 @@ def ensure_well(conn: sqlite3.Connection, well: str) -> None:
 def get_well_volume(conn: sqlite3.Connection, well: str) -> Decimal | None:
     row = conn.execute("SELECT volume FROM wells WHERE well = ?", (well,)).fetchone()
     return None if row is None else Decimal(row["volume"])
+
+
+def get_well_capacity(conn: sqlite3.Connection, well: str) -> Decimal | None:
+    """孔位容量上限；孔位不存在或未设置（NULL）均视为不限，返回 None。"""
+    row = conn.execute("SELECT capacity FROM wells WHERE well = ?", (well,)).fetchone()
+    return None if row is None or row["capacity"] is None else Decimal(row["capacity"])
+
+
+def set_capacity(conn: sqlite3.Connection, well: str, capacity: Decimal | None) -> None:
+    """设置（或显式 None 取消）孔位容量；新上限低于当前体积则拒绝且不改配置。"""
+    row = conn.execute("SELECT volume FROM wells WHERE well = ?", (well,)).fetchone()
+    if row is None:
+        raise KeyError(well)
+    if capacity is not None and Decimal(row["volume"]) > capacity:
+        raise CapacityBelowVolume(well, Decimal(row["volume"]), capacity)
+    value = None if capacity is None else dec_str(capacity)
+    conn.execute("UPDATE wells SET capacity = ? WHERE well = ?", (value, well))
 
 
 def _composition_amount(conn: sqlite3.Connection, well: str, sample_id: int) -> Decimal:
@@ -95,12 +137,20 @@ def _record_event(
 
 
 def register_initial_sample(conn: sqlite3.Connection, well: str, sample: str, volume: Decimal) -> None:
-    """登记初始样本；孔位已有液体时视为补液并立即混匀。"""
+    """登记初始样本；孔位已有液体时视为补液并立即混匀。
+
+    写入前按该孔当前容量校验：超限抛 CapacityExceeded，液体状态不变。
+    """
     ensure_well(conn, well)
+    volume = q(volume)
+    current = get_well_volume(conn, well)
+    capacity = get_well_capacity(conn, well)
+    if capacity is not None and current + volume > capacity:
+        raise CapacityExceeded(well, current, volume, capacity)
     sample_id = ensure_sample(conn, sample)
-    _set_volume(conn, well, q(get_well_volume(conn, well) + volume))
+    _set_volume(conn, well, current + volume)
     _set_composition(conn, well, sample_id, q(_composition_amount(conn, well, sample_id) + volume))
-    _record_event(conn, well, "top_up", sample=sample, volume=dec_str(q(volume)))
+    _record_event(conn, well, "top_up", sample=sample, volume=dec_str(volume))
 
 
 def _allocate_move(
@@ -151,6 +201,16 @@ def apply_transfer(conn: sqlite3.Connection, source: str, destination: str, volu
     for sample_id, amount in amounts:
         moved = QUANTUM * moved_units.get(sample_id, 0)
         moved_total += moved
+
+    # 按本步执行后的目标孔体积校验当时容量：同批此前各步（含先移出本孔的
+    # 一步）都已反映在目标当前体积中；超限抛异常，本步及整批由调用方回滚。
+    dst_volume = get_well_volume(conn, destination)
+    dst_capacity = get_well_capacity(conn, destination)
+    if dst_capacity is not None and dst_volume + moved_total > dst_capacity:
+        raise CapacityExceeded(destination, dst_volume, moved_total, dst_capacity)
+
+    for sample_id, amount in amounts:
+        moved = QUANTUM * moved_units.get(sample_id, 0)
         _set_composition(conn, source, sample_id, amount - moved)
         if moved:
             _set_composition(
@@ -161,14 +221,17 @@ def apply_transfer(conn: sqlite3.Connection, source: str, destination: str, volu
             )
 
     _set_volume(conn, source, src_volume - moved_total)
-    _set_volume(conn, destination, get_well_volume(conn, destination) + moved_total)
+    _set_volume(conn, destination, dst_volume + moved_total)
 
 
 def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
-    """孔位当前体积 + 各初始样本的量与占比。"""
-    volume = get_well_volume(conn, well)
-    if volume is None:
+    """孔位当前体积 + 各初始样本的量与占比（capacity 为 null 表示不限容）。"""
+    row = conn.execute(
+        "SELECT volume, capacity FROM wells WHERE well = ?", (well,)
+    ).fetchone()
+    if row is None:
         return None
+    volume = Decimal(row["volume"])
     rows = conn.execute(
         "SELECT s.name AS sample, wc.amount AS amount "
         "FROM well_composition wc JOIN samples s ON s.id = wc.sample_id "
@@ -176,13 +239,18 @@ def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
         (well,),
     ).fetchall()
     composition = []
-    for row in rows:
-        amount = Decimal(row["amount"])
+    for r in rows:
+        amount = Decimal(r["amount"])
         fraction = q(amount / volume) if volume > 0 else ZERO
         composition.append(
-            {"sample": row["sample"], "amount": dec_str(amount), "fraction": dec_str(fraction)}
+            {"sample": r["sample"], "amount": dec_str(amount), "fraction": dec_str(fraction)}
         )
-    return {"well": well, "volume": dec_str(volume), "composition": composition}
+    return {
+        "well": well,
+        "volume": dec_str(volume),
+        "capacity": None if row["capacity"] is None else dec_str(Decimal(row["capacity"])),
+        "composition": composition,
+    }
 
 
 # ---------------------------------------------------------------- 批次
@@ -345,6 +413,34 @@ def _batch_blockers(conn: sqlite3.Connection, batch_id: int, wells: list[str]) -
     return blockers
 
 
+def _snapshot_capacity_violations(
+    conn: sqlite3.Connection, batch_id: int, wells: list[str]
+) -> list[dict]:
+    """逐孔核对快照恢复后的体积是否超过该孔当前容量。
+
+    快照 volume 为 NULL（孔在批前不存在）时恢复为删除，不产生体积。
+    """
+    violations: list[dict] = []
+    for well in wells:
+        snap = conn.execute(
+            "SELECT volume FROM batch_well_snapshots WHERE batch_id = ? AND well = ?",
+            (batch_id, well),
+        ).fetchone()
+        if snap is None or snap["volume"] is None:
+            continue
+        capacity = get_well_capacity(conn, well)
+        restored = Decimal(snap["volume"])
+        if capacity is not None and restored > capacity:
+            violations.append(
+                {
+                    "well": well,
+                    "restored_volume": dec_str(restored),
+                    "capacity": dec_str(capacity),
+                }
+            )
+    return violations
+
+
 def _restore_snapshot(conn: sqlite3.Connection, batch_id: int) -> None:
     """把该批次快照中的每个孔原子恢复到批前状态（含删除批次中新出现的孔）。"""
     snaps = conn.execute(
@@ -403,6 +499,16 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
             "blocked",
             f"批次 {batch_id} 之后有补液或后续批次触及相关孔位，不可撤销",
             blockers,
+        )
+
+    # 容量是当前配置而非快照的一部分：逐孔核对恢复后的体积是否超过各孔
+    # 当前上限，任一超限即拒绝整次撤销（恢复与审计记录都不发生）。
+    over = _snapshot_capacity_violations(conn, batch_id, wells)
+    if over:
+        raise ReversalConflict(
+            "capacity_exceeded",
+            f"批次 {batch_id} 撤销后有孔位将超过当前容量上限，不可撤销",
+            over,
         )
 
     _restore_snapshot(conn, batch_id)

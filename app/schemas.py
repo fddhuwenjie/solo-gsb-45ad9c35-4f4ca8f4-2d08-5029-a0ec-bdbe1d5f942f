@@ -38,6 +38,12 @@ class WellCreate(BaseModel):
         return value
 
 
+class CapacityUpdate(BaseModel):
+    """设置孔位容量上限；显式传 null 取消上限（恢复不限容）。"""
+
+    capacity: Decimal | None = Field(default=None, gt=0)
+
+
 class TransferOp(BaseModel):
     """一次移液：从 source 吸取 volume 注入 destination。"""
 

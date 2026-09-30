@@ -16,8 +16,10 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lineage.db"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wells (
-    well    TEXT PRIMARY KEY,
-    volume  TEXT NOT NULL DEFAULT '0'
+    well     TEXT PRIMARY KEY,
+    volume   TEXT NOT NULL DEFAULT '0',
+    -- 可选最大容量，NULL 表示不限；既有孔位迁移后均为 NULL。
+    capacity TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -112,16 +114,28 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """对上线前的旧库做幂等迁移：补 capacity 列（NULL = 不限）。
+
+    CREATE TABLE IF NOT EXISTS 不会改既有表结构，旧卷 lineage.db 需显式
+    加列；既有孔位一律默认不限容，保持现有不限容数据语义。
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(wells)").fetchall()}
+    if "capacity" not in cols:
+        conn.execute("ALTER TABLE wells ADD COLUMN capacity TEXT")
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
 
 
 @contextmanager
 def write_transaction(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     """立即写事务：BEGIN IMMEDIATE 在事务起点就取得保留锁。
 
-    所有变更端点（补液、批次、撤销）都经此进入事务，使「校验读 → 写入 →
+    所有变更端点（补液、批次、撤销、容量变更）都经此进入事务，使「校验读 → 写入 →
     提交」全程互斥串行：后到的事务在 BEGIN IMMEDIATE 处等待，待先到者
     提交后才开始读库，必然读到已提交的新状态，不会以旧快照覆盖新写入
     （例如撤销完成阻塞检查后另一请求的补液）。等不到锁由 busy_timeout
