@@ -266,3 +266,83 @@ def test_concurrent_same_key_other_target_conflicts(client):
         "40" if untouched == b2 else "90"
     )
     assert client.get(f"/wells/{untouched_dest}").json()["volume"] == "10"
+
+
+# ------------------------------------------------ 容量变更与补液串行
+
+
+def test_top_up_committed_first_capacity_change_sees_new_volume(client, monkeypatch):
+    """补液先持锁提交：容量变更在锁后读到新体积，新上限低于它即 409，配置不变。"""
+    register(client, "A1", "S1", "100")
+    gate = _Gate()
+    original_register = ledger.register_initial_sample
+
+    def gated_register(conn, well, sample, volume):
+        # 已在 BEGIN IMMEDIATE 之后执行：写锁在手
+        gate.entered.set()
+        assert gate.release.wait(10.0), "补液线程未被释放"
+        return original_register(conn, well, sample, volume)
+
+    monkeypatch.setattr(ledger, "register_initial_sample", gated_register)
+
+    topup_thread, topup_result = _run_in_thread(lambda: register(client, "A1", "S1", "10"))
+    gate.wait_inside()  # 补液持锁
+
+    cap_thread, cap_result = _run_in_thread(
+        lambda: client.put("/wells/A1/capacity", json={"max_capacity": "105"})
+    )
+    threading.Event().wait(0.3)
+    assert cap_thread.is_alive(), "容量变更应在补液的写锁上排队"
+
+    gate.release.set()
+    topup_body = _join(topup_thread, topup_result)
+    cap_resp = _join(cap_thread, cap_result)
+
+    # 补液先提交：A1=110；容量变更看到已提交的 110，105 < 110 -> 409
+    assert topup_body["volume"] == "110"
+    assert cap_resp.status_code == 409, cap_resp.text
+    detail = cap_resp.json()["detail"]
+    assert detail["reason"] == "capacity_below_volume"
+    assert detail["volume"] == "110"
+    # 配置不变：仍为不限
+    assert client.get("/wells/A1").json()["max_capacity"] is None
+
+
+def test_capacity_committed_first_top_up_sees_limit(client, monkeypatch):
+    """容量变更先持锁提交：补液在锁后读到新上限，超限即 409，液体不变。"""
+    register(client, "A1", "S1", "100")
+    gate = _Gate()
+    original_set = ledger.set_well_capacity
+
+    def gated_set(conn, well, capacity):
+        # 已在 BEGIN IMMEDIATE 之后执行：写锁在手
+        gate.entered.set()
+        assert gate.release.wait(10.0), "容量变更线程未被释放"
+        return original_set(conn, well, capacity)
+
+    monkeypatch.setattr(ledger, "set_well_capacity", gated_set)
+
+    cap_thread, cap_result = _run_in_thread(
+        lambda: client.put("/wells/A1/capacity", json={"max_capacity": "105"})
+    )
+    gate.wait_inside()  # 容量变更持锁
+
+    topup_thread, topup_result = _run_in_thread(
+        lambda: client.post("/wells", json={"well": "A1", "sample": "S1", "volume": "10"})
+    )
+    threading.Event().wait(0.3)
+    assert topup_thread.is_alive(), "补液应在容量变更的写锁上排队"
+
+    gate.release.set()
+    cap_resp = _join(cap_thread, cap_result)
+    topup_resp = _join(topup_thread, topup_result)
+
+    # 容量变更先提交：上限 105；补液看到已提交的上限，100+10 > 105 -> 409
+    assert cap_resp.status_code == 200, cap_resp.text
+    assert cap_resp.json()["max_capacity"] == "105"
+    assert topup_resp.status_code == 409, topup_resp.text
+    detail = topup_resp.json()["detail"]
+    assert detail["reason"] == "capacity_exceeded"
+    assert detail["max_capacity"] == "105"
+    # 液体不变
+    assert client.get("/wells/A1").json()["volume"] == "100"

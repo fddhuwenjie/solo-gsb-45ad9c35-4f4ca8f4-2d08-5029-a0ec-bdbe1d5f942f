@@ -10,7 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, Response
 
 from . import db as db_module
 from . import ledger
-from .schemas import BatchCreate, ReversalCreate, WellCreate
+from .schemas import BatchCreate, CapacityUpdate, ReversalCreate, WellCreate
 
 
 @asynccontextmanager
@@ -42,13 +42,63 @@ def health() -> dict:
 
 # ---------------------------------------------------------------- 孔位
 
+def _capacity_exceeded_detail(exc: ledger.CapacityExceeded, **extra) -> dict:
+    """容量超限 409 的统一载荷：超限孔位、当时体积、拟加入量与上限。"""
+    return {
+        "message": str(exc),
+        "reason": "capacity_exceeded",
+        "well": exc.well,
+        "volume": ledger.dec_str(exc.volume),
+        "adding": ledger.dec_str(exc.adding),
+        "max_capacity": ledger.dec_str(exc.max_capacity),
+        **extra,
+    }
+
+
 @app.post("/wells", status_code=201)
 def register_well(payload: WellCreate, conn: sqlite3.Connection = Depends(get_db)) -> dict:
-    """登记孔位中的初始样本与体积；同一孔位重复登记视为补液混匀。"""
-    with db_module.write_transaction(conn):
-        # 立即取写锁：读改写与并发撤销/批次串行，补液不会被旧快照覆盖
-        ledger.register_initial_sample(conn, payload.well, payload.sample, payload.volume)
+    """登记孔位中的初始样本与体积；同一孔位重复登记视为补液混匀。
+
+    孔位设有容量上限时，补液后体积超过上限返回 409，液体状态不变。
+    """
+    try:
+        with db_module.write_transaction(conn):
+            # 立即取写锁：读改写与并发撤销/批次/容量变更串行，补液不会被旧快照覆盖
+            ledger.register_initial_sample(conn, payload.well, payload.sample, payload.volume)
+    except ledger.CapacityExceeded as exc:
+        raise HTTPException(status_code=409, detail=_capacity_exceeded_detail(exc))
     return ledger.well_state(conn, payload.well)
+
+
+@app.put("/wells/{well}/capacity")
+def set_capacity(
+    well: str,
+    payload: CapacityUpdate,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    """设置或取消孔位的最大容量（"max_capacity": null 表示取消，恢复不限）。
+
+    新上限低于孔位当前体积时返回 409 且配置不变。容量变更与补液、批次、
+    撤销共用同一把写锁串行：先提交者决定后续校验看到的状态。
+    """
+    well = well.strip().upper()
+    try:
+        with db_module.write_transaction(conn):
+            ledger.set_well_capacity(conn, well, payload.max_capacity)
+    except ledger.WellNotFound:
+        raise HTTPException(status_code=404, detail=f"孔位 {well} 尚未登记")
+    except ledger.CapacityConflict as exc:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": str(exc),
+                "reason": "capacity_below_volume",
+                "well": exc.well,
+                "volume": ledger.dec_str(exc.volume),
+                "max_capacity": ledger.dec_str(exc.max_capacity),
+            },
+        )
+    return ledger.well_state(conn, well)
 
 
 @app.get("/wells/{well}")
@@ -85,7 +135,7 @@ def submit_batch(
     response: Response,
     conn: sqlite3.Connection = Depends(get_db),
 ) -> dict:
-    """提交一批移液操作：单事务按序执行，任一步体积不足则整批回滚。
+    """提交一批移液操作：单事务按序执行，任一步体积不足或目标孔容量超限则整批回滚。
 
     request_key 幂等：相同键重复提交不会重复执行，直接返回首个结果。
     """
@@ -117,6 +167,19 @@ def submit_batch(
                 "available": ledger.dec_str(exc.available),
                 "requested": ledger.dec_str(exc.requested),
             },
+        )
+    except ledger.CapacityExceeded as exc:
+        # 与体积不足同理：状态已回滚；失败批次落库并消耗 request_key
+        try:
+            with db_module.write_transaction(conn):
+                batch_id = ledger.insert_batch(conn, payload.request_key, "failed", error=str(exc))
+        except sqlite3.IntegrityError:
+            row = ledger.find_batch_by_key(conn, payload.request_key)
+            response.status_code = 200
+            return ledger.batch_payload(conn, row["id"], replayed=True)
+        raise HTTPException(
+            status_code=409,
+            detail=_capacity_exceeded_detail(exc, batch_id=batch_id),
         )
     except sqlite3.IntegrityError:
         # 并发下同一 request_key 已被写入：按重放处理，不重复执行
@@ -165,10 +228,10 @@ def reverse_batch(
 ) -> dict:
     """撤销一个已提交批次：原子恢复其批前快照并追加审计记录，不删除原批次。
 
-    仅当目标批次已提交、尚未撤销、保存了批前快照，且之后没有补液或已提交
-    批次触及相关孔位时可撤销；条件不符返回 409 并列出阻塞孔位与后续操作，
-    液体状态保持不变。request_key 幂等：同键同目标返回首次结果（200），
-    同键换目标返回 409。
+    仅当目标批次已提交、尚未撤销、保存了批前快照，之后没有补液或已提交
+    批次触及相关孔位，且快照恢复后的各孔体积不超过其当前容量上限时可撤销；
+    条件不符返回 409 并列出阻塞孔位或超限孔位，液体状态保持不变。
+    request_key 幂等：同键同目标返回首次结果（200），同键换目标返回 409。
     """
     # 事务外快速路径：无并发时直接给出重放/换目标结论，免取写锁。
     existing = ledger.find_reversal_by_key(conn, payload.request_key)
@@ -208,6 +271,8 @@ def reverse_batch(
         detail: dict = {"message": exc.message, "reason": exc.reason, "batch_id": batch_id}
         if exc.blockers:
             detail["blocking_wells"] = exc.blockers
+        if exc.exceeding:
+            detail["exceeding_wells"] = exc.exceeding
         raise HTTPException(status_code=409, detail=detail)
     except sqlite3.IntegrityError:
         # 兜底：极端并发下 request_key 唯一约束拦截（正常已被锁内复核覆盖）

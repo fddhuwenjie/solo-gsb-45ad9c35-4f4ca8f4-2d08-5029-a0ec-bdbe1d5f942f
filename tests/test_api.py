@@ -677,3 +677,271 @@ def test_reversal_conflict_is_atomic(client):
         assert conn.execute("SELECT COUNT(*) FROM reversals").fetchone()[0] == 0
     finally:
         conn.close()
+
+
+# ------------------------------------------------ 孔位容量上限
+
+
+def set_capacity(client, well, max_capacity):
+    return client.put(f"/wells/{well}/capacity", json={"max_capacity": max_capacity})
+
+
+def test_capacity_defaults_to_unlimited(client):
+    body = register(client, "A1", "S1", "100")
+    assert body["max_capacity"] is None
+    assert client.get("/wells/A1").json()["max_capacity"] is None
+    # 不限容：任意大额补液照常成功
+    body = register(client, "A1", "S1", "1000000")
+    assert body["volume"] == "1000100"
+
+
+def test_set_and_clear_capacity(client):
+    register(client, "A1", "S1", "50")
+    resp = set_capacity(client, "A1", "100")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["max_capacity"] == "100"
+    assert client.get("/wells/A1").json()["max_capacity"] == "100"
+
+    # 取消上限（null）恢复不限
+    resp = set_capacity(client, "A1", None)
+    assert resp.status_code == 200
+    assert resp.json()["max_capacity"] is None
+    assert client.get("/wells/A1").json()["max_capacity"] is None
+
+
+def test_capacity_below_current_volume_conflicts(client):
+    register(client, "A1", "S1", "50")
+    resp = set_capacity(client, "A1", "40")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "capacity_below_volume"
+    assert detail["well"] == "A1"
+    assert detail["volume"] == "50"
+    assert detail["max_capacity"] == "40"
+    # 配置不变：仍为不限
+    assert client.get("/wells/A1").json()["max_capacity"] is None
+
+    # 等于当前体积允许（上限不低于当前体积）
+    assert set_capacity(client, "A1", "50").status_code == 200
+    assert client.get("/wells/A1").json()["max_capacity"] == "50"
+
+
+def test_capacity_unknown_well_is_404(client):
+    assert set_capacity(client, "Z9", "10").status_code == 404
+
+
+def test_capacity_invalid_value_rejected(client):
+    register(client, "A1", "S1", "10")
+    assert set_capacity(client, "A1", "0").status_code == 422
+    assert set_capacity(client, "A1", "-5").status_code == 422
+    assert set_capacity(client, "A1", "abc").status_code == 422
+
+
+def test_top_up_respects_capacity(client):
+    register(client, "A1", "S1", "50")
+    assert set_capacity(client, "A1", "60").status_code == 200
+
+    resp = client.post("/wells", json={"well": "A1", "sample": "S1", "volume": "20"})
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "capacity_exceeded"
+    assert detail["well"] == "A1"
+    assert detail["volume"] == "50"  # 当时体积
+    assert detail["adding"] == "20"  # 拟加入量
+    assert detail["max_capacity"] == "60"
+    # 液体状态不变
+    assert client.get("/wells/A1").json()["volume"] == "50"
+
+    # 上限内补液成功（恰好到顶）
+    body = register(client, "A1", "S1", "10")
+    assert body["volume"] == "60"
+
+
+def test_capacity_uses_decimal_precision(client):
+    register(client, "A1", "S1", "0.000000005")
+    resp = set_capacity(client, "A1", "0.000000008")
+    assert resp.status_code == 200
+    assert resp.json()["max_capacity"] == "0.000000008"
+
+    # 0.000000005 + 0.000000004 = 0.000000009 > 0.000000008
+    resp = client.post("/wells", json={"well": "A1", "sample": "S1", "volume": "0.000000004"})
+    assert resp.status_code == 409
+    # 0.000000003 恰好到上限
+    body = register(client, "A1", "S1", "0.000000003")
+    assert body["volume"] == "0.000000008"
+    assert_invariant(client, "A1")
+
+
+def test_batch_rolls_back_on_capacity_exceeded(client):
+    register(client, "A1", "S1", "100")
+    register(client, "B1", "S2", "50")
+    assert set_capacity(client, "B1", "60").status_code == 200
+
+    payload = {
+        "request_key": "cap-batch",
+        "operations": [
+            {"source": "A1", "destination": "C1", "volume": "10"},  # 本步可成功
+            {"source": "A1", "destination": "B1", "volume": "20"},  # 50+20=70 > 60
+        ],
+    }
+    resp = client.post("/batches", json=payload)
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "capacity_exceeded"
+    assert detail["well"] == "B1"
+    assert detail["volume"] == "50"
+    assert detail["adding"] == "20"
+    assert detail["max_capacity"] == "60"
+
+    # 整批回滚：A1 不变，C1 从未被创建
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/C1").status_code == 404
+    assert client.get("/wells/B1").json()["volume"] == "50"
+
+    # 失败批次落库并消耗 request_key
+    batch = client.get(f"/batches/{detail['batch_id']}").json()
+    assert batch["status"] == "failed"
+    assert "容量超限" in batch["error"]
+    replay = client.post("/batches", json=payload)
+    assert replay.status_code == 200
+    assert replay.json()["replayed"] is True
+    assert replay.json()["status"] == "failed"
+
+
+def test_batch_capacity_checked_per_step(client):
+    """上限按每一步当时的目标体积校验：第一步到位后，第二步按新体积判定。"""
+    register(client, "A1", "S1", "100")
+    register(client, "B1", "S2", "10")
+    assert set_capacity(client, "B1", "70").status_code == 200
+
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "stepwise",
+            "operations": [
+                {"source": "A1", "destination": "B1", "volume": "40"},  # 10+40=50 ≤ 70
+                {"source": "A1", "destination": "B1", "volume": "40"},  # 50+40=90 > 70
+            ],
+        },
+    )
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["well"] == "B1"
+    assert detail["volume"] == "50"  # 第二步时的当时体积
+    assert detail["adding"] == "40"
+    assert detail["max_capacity"] == "70"
+    # 整批回滚
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    assert client.get("/wells/B1").json()["volume"] == "10"
+
+
+def test_batch_move_out_then_in_within_capacity(client):
+    """同一批次先移出再移入：每步按当时体积校验，移出腾出的空间本批即可用。"""
+    register(client, "A1", "S1", "50")
+    register(client, "B1", "S2", "70")
+    assert set_capacity(client, "B1", "80").status_code == 200
+
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "out-then-in",
+            "operations": [
+                {"source": "B1", "destination": "C1", "volume": "30"},  # B1: 70 -> 40
+                {"source": "A1", "destination": "B1", "volume": "40"},  # B1: 40 -> 80 ≤ 80
+            ],
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    assert client.get("/wells/B1").json()["volume"] == "80"
+    assert client.get("/wells/C1").json()["volume"] == "30"
+    assert_invariant(client, "B1")
+
+    # 若直接移入（不先移出）：80+1 > 80，整批失败
+    resp = client.post(
+        "/batches",
+        json={
+            "request_key": "in-over",
+            "operations": [{"source": "A1", "destination": "B1", "volume": "1"}],
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["reason"] == "capacity_exceeded"
+    assert client.get("/wells/B1").json()["volume"] == "80"
+
+
+def test_reversal_rejected_when_snapshot_exceeds_current_capacity(client):
+    """快照恢复后的体积超过孔位当前上限：整次撤销拒绝，液体与审计记录不变。"""
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "rc-1", "A1", "B1", "40")  # A1: 100 -> 60
+    # 当前 A1=60，可设上限 80；但撤销会把 A1 恢复到 100 > 80
+    assert set_capacity(client, "A1", "80").status_code == 200
+
+    resp = reverse(client, bid, "rev-cap")
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "capacity_exceeded"
+    assert detail["exceeding_wells"] == [
+        {"well": "A1", "volume": "100", "max_capacity": "80"}
+    ]
+
+    # 液体与审计记录不变
+    assert client.get("/wells/A1").json()["volume"] == "60"
+    assert client.get("/wells/B1").json()["volume"] == "40"
+    assert client.get(f"/batches/{bid}").json()["reversed"] is False
+
+    import os
+    import sqlite3
+
+    conn = sqlite3.connect(os.environ["LINEAGE_DB"])
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM reversals").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    # 冲突不消耗撤销 request_key：取消上限后同键撤销成功
+    assert set_capacity(client, "A1", None).status_code == 200
+    assert reverse(client, bid, "rev-cap").status_code == 201
+    assert client.get("/wells/A1").json()["volume"] == "100"
+
+
+def test_reversal_allowed_when_snapshot_within_capacity(client):
+    """快照恢复后的体积不超过当前上限时，撤销正常进行。"""
+    register(client, "A1", "S1", "100")
+    bid = committed_batch_id(client, "rc-ok", "A1", "B1", "40")
+    assert set_capacity(client, "A1", "100").status_code == 200
+    assert reverse(client, bid, "rev-ok").status_code == 201
+    assert client.get("/wells/A1").json()["volume"] == "100"
+    # 容量配置不受快照恢复影响
+    assert client.get("/wells/A1").json()["max_capacity"] == "100"
+
+
+def test_preexisting_database_without_capacity_column_migrates(tmp_path, monkeypatch):
+    """老库（wells 无 max_capacity 列）启动时就地迁移，既有数据默认不限容。"""
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    db_file = tmp_path / "legacy.db"
+    conn = sqlite3.connect(db_file)
+    conn.executescript(
+        """
+        CREATE TABLE wells (well TEXT PRIMARY KEY, volume TEXT NOT NULL DEFAULT '0');
+        INSERT INTO wells (well, volume) VALUES ('A1', '50');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setenv("LINEAGE_DB", str(db_file))
+    from app.main import app
+
+    with TestClient(app) as client:
+        body = client.get("/wells/A1").json()
+        assert body["volume"] == "50"
+        assert body["max_capacity"] is None
+        # 既有数据行为不变：不限容，大额补液照常成功
+        resp = client.post("/wells", json={"well": "A1", "sample": "S1", "volume": "1000"})
+        assert resp.status_code == 201
+        assert resp.json()["volume"] == "1050"
+        # 迁移后新功能可用
+        assert set_capacity(client, "A1", "2000").status_code == 200

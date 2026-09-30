@@ -17,7 +17,9 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "lineage.db"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS wells (
     well    TEXT PRIMARY KEY,
-    volume  TEXT NOT NULL DEFAULT '0'
+    volume  TEXT NOT NULL DEFAULT '0',
+    -- 可选最大容量：NULL 表示不限；TEXT 存 Decimal 字符串
+    max_capacity TEXT
 );
 
 CREATE TABLE IF NOT EXISTS samples (
@@ -115,6 +117,17 @@ def connect() -> sqlite3.Connection:
 def init_db() -> None:
     with connect() as conn:
         conn.executescript(SCHEMA)
+        _migrate(conn)
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """老库就地升级：wells 表补 max_capacity 列。
+
+    既有行的 max_capacity 为 NULL（不限容量），现有数据与行为完全保留。
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(wells)")}
+    if "max_capacity" not in columns:
+        conn.execute("ALTER TABLE wells ADD COLUMN max_capacity TEXT")
 
 
 @contextmanager

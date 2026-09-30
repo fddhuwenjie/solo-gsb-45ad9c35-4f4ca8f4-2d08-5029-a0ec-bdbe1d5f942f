@@ -21,6 +21,41 @@ class InsufficientVolume(Exception):
         super().__init__(f"孔位 {well} 体积不足：可用 {available}，请求吸取 {requested}")
 
 
+class WellNotFound(Exception):
+    """孔位尚未登记。"""
+
+    def __init__(self, well: str) -> None:
+        self.well = well
+        super().__init__(f"孔位 {well} 尚未登记")
+
+
+class CapacityExceeded(Exception):
+    """补液/移液将使目标孔超过其容量上限：补液整体拒绝，批次整批回滚。"""
+
+    def __init__(
+        self, well: str, volume: Decimal, adding: Decimal, max_capacity: Decimal
+    ) -> None:
+        self.well = well
+        self.volume = volume  # 加入之前的当时体积
+        self.adding = adding  # 拟加入量
+        self.max_capacity = max_capacity
+        super().__init__(
+            f"孔位 {well} 容量超限：当前体积 {volume}，拟加入 {adding}，上限 {max_capacity}"
+        )
+
+
+class CapacityConflict(Exception):
+    """新容量上限低于孔位当前体积：拒绝变更，容量配置保持不变。"""
+
+    def __init__(self, well: str, volume: Decimal, max_capacity: Decimal) -> None:
+        self.well = well
+        self.volume = volume
+        self.max_capacity = max_capacity
+        super().__init__(
+            f"孔位 {well} 当前体积 {volume} 高于新容量上限 {max_capacity}，容量配置不变"
+        )
+
+
 def q(value: Decimal) -> Decimal:
     """量化到统一精度。quantize 单调不减，组分量不会被放大到超过原值。"""
     return value.quantize(QUANTUM, rounding=ROUND_HALF_UP)
@@ -46,6 +81,32 @@ def ensure_well(conn: sqlite3.Connection, well: str) -> None:
 def get_well_volume(conn: sqlite3.Connection, well: str) -> Decimal | None:
     row = conn.execute("SELECT volume FROM wells WHERE well = ?", (well,)).fetchone()
     return None if row is None else Decimal(row["volume"])
+
+
+def get_well_capacity(conn: sqlite3.Connection, well: str) -> Decimal | None:
+    """孔位容量上限；孔未登记或不限（NULL）时返回 None。"""
+    row = conn.execute("SELECT max_capacity FROM wells WHERE well = ?", (well,)).fetchone()
+    if row is None or row["max_capacity"] is None:
+        return None
+    return Decimal(row["max_capacity"])
+
+
+def set_well_capacity(conn: sqlite3.Connection, well: str, capacity: Decimal | None) -> None:
+    """设置（capacity）或取消（None）孔位容量上限。
+
+    新上限低于当前体积时抛 CapacityConflict，配置保持不变；孔未登记抛
+    WellNotFound。调用方须在写事务内调用，使容量变更与补液/批次/撤销串行。
+    """
+    row = conn.execute("SELECT volume FROM wells WHERE well = ?", (well,)).fetchone()
+    if row is None:
+        raise WellNotFound(well)
+    volume = Decimal(row["volume"])
+    if capacity is not None and capacity < volume:
+        raise CapacityConflict(well, volume, capacity)
+    conn.execute(
+        "UPDATE wells SET max_capacity = ? WHERE well = ?",
+        (None if capacity is None else dec_str(capacity), well),
+    )
 
 
 def _composition_amount(conn: sqlite3.Connection, well: str, sample_id: int) -> Decimal:
@@ -95,12 +156,21 @@ def _record_event(
 
 
 def register_initial_sample(conn: sqlite3.Connection, well: str, sample: str, volume: Decimal) -> None:
-    """登记初始样本；孔位已有液体时视为补液并立即混匀。"""
+    """登记初始样本；孔位已有液体时视为补液并立即混匀。
+
+    孔位设有容量上限时，补液后的体积超过上限即抛 CapacityExceeded，
+    由调用方回滚，液体状态不变。
+    """
     ensure_well(conn, well)
     sample_id = ensure_sample(conn, sample)
-    _set_volume(conn, well, q(get_well_volume(conn, well) + volume))
+    current = get_well_volume(conn, well)
+    added = q(volume)
+    capacity = get_well_capacity(conn, well)
+    if capacity is not None and current + added > capacity:
+        raise CapacityExceeded(well, current, added, capacity)
+    _set_volume(conn, well, current + added)
     _set_composition(conn, well, sample_id, q(_composition_amount(conn, well, sample_id) + volume))
-    _record_event(conn, well, "top_up", sample=sample, volume=dec_str(q(volume)))
+    _record_event(conn, well, "top_up", sample=sample, volume=dec_str(added))
 
 
 def _allocate_move(
@@ -160,15 +230,25 @@ def apply_transfer(conn: sqlite3.Connection, source: str, destination: str, volu
                 _composition_amount(conn, destination, sample_id) + moved,
             )
 
+    # 目标孔容量按本步执行时的当时体积校验：同一批次先移出再移入因此可行；
+    # 超限抛 CapacityExceeded，由调用方回滚整批。
+    dst_volume = get_well_volume(conn, destination)
+    capacity = get_well_capacity(conn, destination)
+    if capacity is not None and dst_volume + moved_total > capacity:
+        raise CapacityExceeded(destination, dst_volume, moved_total, capacity)
+
     _set_volume(conn, source, src_volume - moved_total)
-    _set_volume(conn, destination, get_well_volume(conn, destination) + moved_total)
+    _set_volume(conn, destination, dst_volume + moved_total)
 
 
 def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
-    """孔位当前体积 + 各初始样本的量与占比。"""
-    volume = get_well_volume(conn, well)
-    if volume is None:
+    """孔位当前体积、容量上限（None 为不限）与各初始样本的量与占比。"""
+    row = conn.execute(
+        "SELECT volume, max_capacity FROM wells WHERE well = ?", (well,)
+    ).fetchone()
+    if row is None:
         return None
+    volume = Decimal(row["volume"])
     rows = conn.execute(
         "SELECT s.name AS sample, wc.amount AS amount "
         "FROM well_composition wc JOIN samples s ON s.id = wc.sample_id "
@@ -176,13 +256,20 @@ def well_state(conn: sqlite3.Connection, well: str) -> dict | None:
         (well,),
     ).fetchall()
     composition = []
-    for row in rows:
-        amount = Decimal(row["amount"])
+    for row2 in rows:
+        amount = Decimal(row2["amount"])
         fraction = q(amount / volume) if volume > 0 else ZERO
         composition.append(
-            {"sample": row["sample"], "amount": dec_str(amount), "fraction": dec_str(fraction)}
+            {"sample": row2["sample"], "amount": dec_str(amount), "fraction": dec_str(fraction)}
         )
-    return {"well": well, "volume": dec_str(volume), "composition": composition}
+    return {
+        "well": well,
+        "volume": dec_str(volume),
+        "max_capacity": (
+            None if row["max_capacity"] is None else dec_str(Decimal(row["max_capacity"]))
+        ),
+        "composition": composition,
+    }
 
 
 # ---------------------------------------------------------------- 批次
@@ -269,12 +356,19 @@ def batch_payload(conn: sqlite3.Connection, batch_id: int, replayed: bool = Fals
 # ---------------------------------------------------------------- 批次撤销
 
 class ReversalConflict(Exception):
-    """批次当前不可撤销（已撤销/无快照/存在后续阻塞操作）。"""
+    """批次当前不可撤销（已撤销/无快照/存在后续阻塞操作/快照恢复后超容量上限）。"""
 
-    def __init__(self, reason: str, message: str, blockers: list[dict] | None = None) -> None:
+    def __init__(
+        self,
+        reason: str,
+        message: str,
+        blockers: list[dict] | None = None,
+        exceeding: list[dict] | None = None,
+    ) -> None:
         self.reason = reason
         self.message = message
         self.blockers = blockers or []
+        self.exceeding = exceeding or []
         super().__init__(message)
 
 
@@ -384,7 +478,7 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
             f"批次 {batch_id} 状态为 {row['status']}，仅已提交批次可撤销",
         )
     snaps = conn.execute(
-        "SELECT well FROM batch_well_snapshots WHERE batch_id = ? ORDER BY well",
+        "SELECT well, volume FROM batch_well_snapshots WHERE batch_id = ? ORDER BY well",
         (batch_id,),
     ).fetchall()
     if not snaps:
@@ -403,6 +497,28 @@ def apply_reversal(conn: sqlite3.Connection, batch_id: int, request_key: str) ->
             "blocked",
             f"批次 {batch_id} 之后有补液或后续批次触及相关孔位，不可撤销",
             blockers,
+        )
+
+    # 恢复快照前核对：任一快照孔恢复后的体积超过其当前容量上限，即整次
+    # 拒绝撤销（液体与审计记录均不变）。快照为 NULL 的孔恢复后即删除，无需核对。
+    exceeding = []
+    for snap in snaps:
+        if snap["volume"] is None:
+            continue
+        capacity = get_well_capacity(conn, snap["well"])
+        if capacity is not None and Decimal(snap["volume"]) > capacity:
+            exceeding.append(
+                {
+                    "well": snap["well"],
+                    "volume": dec_str(Decimal(snap["volume"])),
+                    "max_capacity": dec_str(capacity),
+                }
+            )
+    if exceeding:
+        raise ReversalConflict(
+            "capacity_exceeded",
+            f"批次 {batch_id} 撤销后部分孔位将超过当前容量上限，不可撤销",
+            exceeding=exceeding,
         )
 
     _restore_snapshot(conn, batch_id)

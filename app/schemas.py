@@ -84,3 +84,9 @@ class ReversalCreate(BaseModel):
         if not value:
             raise ValueError("request_key 不能为空")
         return value
+
+
+class CapacityUpdate(BaseModel):
+    """设置或取消孔位最大容量：正数表示上限，null 表示取消（不限容量）。"""
+
+    max_capacity: Decimal | None = Field(default=None, gt=0)
